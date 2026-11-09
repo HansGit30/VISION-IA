@@ -1,0 +1,40 @@
+# Blueprint de Render: crea la API automáticamente.
+# Render > New > Blueprint > selecciona este repositorio.
+services:
+  - type: web
+    name: vision-ai-api
+    runtime: node
+    plan: free
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRES_IN
+        value: 8h
+      - key: DATABASE_URL        # cadena "Session pooler" de Supabase
+        sync: false
+      - key: CORS_ORIGIN         # ej. https://vision-ai.vercel.app,https://*.vercel.app
+        sync: false
+      - key: SEED_ADMIN_EMAIL
+        value: admin@visionai.pe
+      - key: SEED_ADMIN_PASSWORD
+        sync: false
+      - key: SEED_SUPERVISOR_EMAIL
+        value: supervisor@visionai.pe
+      - key: SEED_SUPERVISOR_PASSWORD
+        sync: false
+      - key: SEED_OPERADOR_EMAIL
+        value: operador@visionai.pe
+      - key: SEED_OPERADOR_PASSWORD
+        sync: false
+      - key: SEED_AUDITOR_EMAIL
+        value: auditor@visionai.pe
+      - key: SEED_AUDITOR_PASSWORD
+        sync: false
