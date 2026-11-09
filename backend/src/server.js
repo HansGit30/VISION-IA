@@ -1,4 +1,6 @@
 
+import 'dotenv/config';
+
 import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
@@ -8,76 +10,163 @@ import { config } from './config.js';
 import { store } from './store.js';
 import { seedUsers } from './seed.js';
 
-const ROLES = ['admin', 'supervisor', 'operador', 'auditor'];
-
-const PERMISSIONS = {
-  'data:read': ['admin', 'supervisor', 'operador', 'auditor'],
-  'data:write': ['admin', 'supervisor', 'operador'],
-  'alerts:review': ['admin', 'supervisor'],
-  'data:clear': ['admin'],
-  'users:manage': ['admin'],
-};
-
-const permissionsFor = role =>
-  Object.keys(PERMISSIONS).filter(p => PERMISSIONS[p].includes(role));
+// ======================================================
+// CONFIGURACIÓN GENERAL
+// ======================================================
 
 const app = express();
 
+const ROLES = [
+  'admin',
+  'supervisor',
+  'operador',
+  'auditor'
+];
+
+const PERMISSIONS = {
+  'data:read': ROLES,
+  'data:write': ['admin', 'supervisor', 'operador'],
+  'alerts:review': ['admin', 'supervisor'],
+  'data:clear': ['admin'],
+  'users:manage': ['admin']
+};
+
+const YOLO_SERVICE_URL = (
+  process.env.YOLO_SERVICE_URL ||
+  'http://127.0.0.1:8000'
+).replace(/\/+$/, '');
+
+const YOLO_TIMEOUT_MS = 180000;
+
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '2mb' }));
+app.disable('x-powered-by');
 
-app.use(cors({
-  origin(origin, cb) {
-    if (!origin) return cb(null, true);
-
-    const ok = config.corsOrigins.some(o =>
-      o === '*' ||
-      o === origin ||
-      (o.startsWith('*.') && origin.endsWith(o.slice(1))) ||
-      (
-        o.includes('://*.') &&
-        origin.startsWith(o.split('://')[0] + '://') &&
-        origin.endsWith(o.split('://*')[1])
-      )
-    );
-
-    cb(
-      ok ? null : new Error('Origen no permitido por CORS: ' + origin),
-      ok
-    );
-  },
+app.use(express.json({
+  limit: '2mb'
 }));
 
-const wrap = fn => (req, res, next) =>
+// ======================================================
+// CORS - VERCEL Y DESARROLLO LOCAL
+// ======================================================
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin) {
+      return callback(null, true);
+    }
+
+    const allowed = config.corsOrigins.some(value => {
+      const item = value.trim();
+
+      if (item === '*' || item === origin) {
+        return true;
+      }
+
+      if (item.startsWith('*.')) {
+        const hostname = new URL(origin).hostname;
+        const suffix = item.slice(1);
+
+        return hostname.endsWith(suffix);
+      }
+
+      if (item.includes('://*.')) {
+        const [protocol, domain] = item.split('://*.');
+        const url = new URL(origin);
+
+        return (
+          url.protocol === protocol + ':' &&
+          url.hostname.endsWith('.' + domain)
+        );
+      }
+
+      return false;
+    });
+
+    if (!allowed) {
+      console.warn('[CORS] Origen rechazado:', origin);
+      return callback(
+        new Error('Origen no permitido por CORS: ' + origin)
+      );
+    }
+
+    callback(null, true);
+  },
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+const wrap = fn => (req, res, next) => {
   Promise.resolve(fn(req, res, next)).catch(next);
+};
 
-/* =====================================================
-   CONTROL DE INTENTOS DE LOGIN
-===================================================== */
+// ======================================================
+// PERMISOS
+// ======================================================
 
-const attempts = new Map();
-
-function tooManyAttempts(key) {
-  const now = Date.now();
-  const win = 15 * 60 * 1000;
-
-  const list = (attempts.get(key) || [])
-    .filter(t => now - t < win);
-
-  attempts.set(key, list);
-  return list.length >= 10;
+function permissionsFor(role) {
+  return Object.keys(PERMISSIONS).filter(permission =>
+    PERMISSIONS[permission].includes(role)
+  );
 }
 
-const recordFail = key =>
-  attempts.set(key, [...(attempts.get(key) || []), Date.now()]);
+function can(permission) {
+  return (req, res, next) => {
+    if (!PERMISSIONS[permission]?.includes(req.user.role)) {
+      return res.status(403).json({
+        error: 'Tu rol no tiene permiso para esta acción'
+      });
+    }
 
-/* =====================================================
-   AUTENTICACIÓN JWT
-===================================================== */
+    next();
+  };
+}
+
+function publicUser(user) {
+  return {
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    role: user.role,
+    permissions: permissionsFor(user.role)
+  };
+}
+
+// ======================================================
+// CONTROL DE INTENTOS DE LOGIN
+// ======================================================
+
+const loginAttempts = new Map();
+
+function getAttempts(key) {
+  const now = Date.now();
+  const windowMs = 15 * 60 * 1000;
+
+  const attempts = (loginAttempts.get(key) || [])
+    .filter(time => now - time < windowMs);
+
+  if (attempts.length) {
+    loginAttempts.set(key, attempts);
+  } else {
+    loginAttempts.delete(key);
+  }
+
+  return attempts;
+}
+
+function recordFailedLogin(key) {
+  const attempts = getAttempts(key);
+  attempts.push(Date.now());
+  loginAttempts.set(key, attempts);
+}
+
+// ======================================================
+// AUTENTICACIÓN JWT
+// ======================================================
 
 async function auth(req, res, next) {
-  const token = (req.headers.authorization || '')
-    .replace(/^Bearer\s+/i, '');
+  const authorization = req.headers.authorization || '';
+
+  const token = authorization.replace(/^Bearer\s+/i, '');
 
   if (!token) {
     return res.status(401).json({
@@ -85,8 +174,17 @@ async function auth(req, res, next) {
     });
   }
 
+  let payload;
+
   try {
-    const payload = jwt.verify(token, config.jwtSecret);
+    payload = jwt.verify(token, config.jwtSecret);
+  } catch {
+    return res.status(401).json({
+      error: 'Sesión expirada. Vuelve a iniciar sesión.'
+    });
+  }
+
+  try {
     const user = await store.users.findById(payload.sub);
 
     if (!user || !user.active) {
@@ -97,52 +195,48 @@ async function auth(req, res, next) {
 
     req.user = user;
     next();
-
-  } catch {
-    return res.status(401).json({
-      error: 'Sesión expirada, vuelve a iniciar sesión'
-    });
+  } catch (error) {
+    next(error);
   }
 }
 
-const can = perm => (req, res, next) =>
-  PERMISSIONS[perm].includes(req.user.role)
-    ? next()
-    : res.status(403).json({
-        error: 'Tu rol no tiene permiso para esta acción'
-      });
-
-const me = u => ({
-  id: u.id,
-  email: u.email,
-  name: u.name,
-  role: u.role,
-  permissions: permissionsFor(u.role)
-});
-
-/* =====================================================
-   ESTADO DEL SERVIDOR
-===================================================== */
+// ======================================================
+// ESTADO DEL BACKEND
+// ======================================================
 
 app.get('/', (_req, res) => {
   res.json({
     name: 'VISION AI API',
     status: 'ok',
-    docs: '/api/health'
+    health: '/api/health'
   });
 });
 
 app.get('/api/health', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+
   res.json({
     ok: true,
+    service: 'VISION AI Backend',
     storage: store.kind,
+    yoloConfigured: Boolean(YOLO_SERVICE_URL),
     time: new Date().toISOString()
   });
 });
 
-/* =====================================================
-   YOLO - DETECCIÓN, SEGMENTACIÓN Y CALIDAD
-===================================================== */
+// ======================================================
+// YOLO - DETECCIÓN, SEGMENTACIÓN Y CALIDAD
+// ======================================================
+
+const imageParser = express.raw({
+  type: [
+    'image/jpeg',
+    'image/png',
+    'image/webp',
+    'application/octet-stream'
+  ],
+  limit: '12mb'
+});
 
 app.post(
   [
@@ -152,58 +246,54 @@ app.post(
   ],
   auth,
   can('data:write'),
-  express.raw({
-    type: [
-      'image/jpeg',
-      'image/png',
-      'image/webp',
-      'application/octet-stream'
-    ],
-    limit: '12mb'
-  }),
+  imageParser,
   wrap(async (req, res) => {
 
-    if (!Buffer.isBuffer(req.body) || !req.body.length) {
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
       return res.status(400).json({
-        error: 'Envía una imagen válida'
+        error: 'Debes enviar una imagen válida.'
       });
     }
 
-    let endpoint = '/detect';
+    const endpoint = req.path.endsWith('/segment')
+      ? '/segment'
+      : req.path.endsWith('/quality')
+        ? '/quality'
+        : '/detect';
 
-    if (req.path.endsWith('/segment')) {
-      endpoint = '/segment';
-    }
+    const rawConfidence = req.query.confidence;
+    const parsedConfidence = Number(rawConfidence);
 
-    if (req.path.endsWith('/quality')) {
-      endpoint = '/quality';
-    }
-
-    const confidenceInput = Number(req.query.confidence);
-
-    const confidence = Number.isFinite(confidenceInput)
-      ? Math.max(0.01, Math.min(0.99, confidenceInput))
+    const confidence = (
+      rawConfidence !== undefined &&
+      rawConfidence !== '' &&
+      Number.isFinite(parsedConfidence)
+    )
+      ? Math.max(0.01, Math.min(0.99, parsedConfidence))
       : 0.25;
 
-    const controller = new AbortController();
+    const url = new URL(YOLO_SERVICE_URL + endpoint);
 
-    const timeout = setTimeout(
-      () => controller.abort(),
-      120000
+    url.searchParams.set(
+      'confidence',
+      String(confidence)
     );
 
+    const controller = new AbortController();
+    const started = Date.now();
+
+    const timeout = setTimeout(() => {
+      controller.abort();
+    }, YOLO_TIMEOUT_MS);
+
+    console.log('[YOLO] Iniciando análisis:', {
+      endpoint,
+      bytes: req.body.length,
+      confidence,
+      service: YOLO_SERVICE_URL
+    });
+
     try {
-      const baseUrl =
-        process.env.YOLO_SERVICE_URL ||
-        'http://127.0.0.1:8000';
-
-      const url = new URL(endpoint, baseUrl);
-
-      url.searchParams.set(
-        'confidence',
-        String(confidence)
-      );
-
       const response = await fetch(url, {
         method: 'POST',
         headers: {
@@ -218,19 +308,70 @@ app.post(
       const contentType =
         response.headers.get('content-type') || '';
 
-      const data = contentType.includes('application/json')
-        ? await response.json()
-        : {
-            error: 'Respuesta no JSON del servicio YOLO',
-            detail: (await response.text()).slice(0, 300)
+      const responseText = await response.text();
+
+      let data;
+
+      if (contentType.includes('application/json')) {
+        try {
+          data = JSON.parse(responseText);
+        } catch {
+          data = {
+            error: 'Respuesta JSON inválida del servicio YOLO'
           };
+        }
+      } else {
+        data = {
+          error: response.ok
+            ? 'Respuesta inesperada del servicio YOLO'
+            : 'El servicio YOLO devolvió un error HTTP',
+          detail: responseText.slice(0, 500)
+        };
+      }
+
+      const durationMs = Date.now() - started;
+
+      console.log('[YOLO] Respuesta:', {
+        endpoint,
+        status: response.status,
+        durationMs
+      });
+
+      if (!response.ok) {
+        console.error('[YOLO] Error del servicio:', {
+          status: response.status,
+          endpoint,
+          detail: data.detail || data.error
+        });
+      }
 
       return res.status(response.status).json(data);
 
-    } catch (err) {
-      return res.status(503).json({
-        error: 'Servicio de inferencia no disponible',
-        detail: err.message
+    } catch (error) {
+      const durationMs = Date.now() - started;
+      const aborted = controller.signal.aborted;
+
+      console.error('[YOLO PROXY ERROR]', {
+        endpoint,
+        name: error.name,
+        message: error.message,
+        cause: error.cause?.message || null,
+        aborted,
+        durationMs
+      });
+
+      if (res.headersSent) {
+        return;
+      }
+
+      return res.status(aborted ? 504 : 503).json({
+        ok: false,
+        error: aborted
+          ? 'Tiempo de espera agotado durante el análisis'
+          : 'Servicio de inferencia no disponible',
+        detail: error.message,
+        endpoint,
+        durationMs
       });
 
     } finally {
@@ -239,38 +380,42 @@ app.post(
   })
 );
 
-/* =====================================================
-   LOGIN
-===================================================== */
+// ======================================================
+// INICIAR SESIÓN
+// ======================================================
 
 app.post('/api/auth/login', wrap(async (req, res) => {
-  const email = String(req.body?.email || '').trim();
+  const email = String(req.body?.email || '')
+    .trim()
+    .toLowerCase();
+
   const password = String(req.body?.password || '');
 
-  const key = req.ip + '|' + email.toLowerCase();
+  const key = req.ip + '|' + email;
 
-  if (tooManyAttempts(key)) {
+  if (getAttempts(key).length >= 10) {
     return res.status(429).json({
       error: 'Demasiados intentos. Espera 15 minutos.'
     });
   }
 
-  const user = email &&
-    await store.users.findByEmail(email);
+  const user = email
+    ? await store.users.findByEmail(email)
+    : null;
 
-  if (
-    !user ||
-    !user.active ||
-    !(await bcrypt.compare(password, user.password_hash))
-  ) {
-    recordFail(key);
+  const validPassword = user && user.active
+    ? await bcrypt.compare(password, user.password_hash)
+    : false;
+
+  if (!user || !user.active || !validPassword) {
+    recordFailedLogin(key);
 
     return res.status(401).json({
       error: 'Correo o contraseña incorrectos'
     });
   }
 
-  attempts.delete(key);
+  loginAttempts.delete(key);
 
   await store.users.touchLogin(user.id);
 
@@ -285,31 +430,30 @@ app.post('/api/auth/login', wrap(async (req, res) => {
     }
   );
 
-  res.json({
+  return res.json({
     token,
-    user: me(user)
+    user: publicUser(user)
   });
 }));
 
-/* =====================================================
-   USUARIO ACTUAL
-===================================================== */
+// ======================================================
+// USUARIO ACTUAL
+// ======================================================
 
 app.get('/api/auth/me', auth, (req, res) => {
   res.json({
-    user: me(req.user)
+    user: publicUser(req.user)
   });
 });
 
-/* =====================================================
-   CAMBIAR CONTRASEÑA
-===================================================== */
+// ======================================================
+// CAMBIAR CONTRASEÑA
+// ======================================================
 
 app.post(
   '/api/auth/change-password',
   auth,
   wrap(async (req, res) => {
-
     const {
       currentPassword,
       newPassword
@@ -336,13 +480,13 @@ app.post(
       passwordHash: await bcrypt.hash(newPassword, 10)
     });
 
-    res.json({ ok: true });
+    return res.json({ ok: true });
   })
 );
 
-/* =====================================================
-   HISTORIAL DE EVENTOS
-===================================================== */
+// ======================================================
+// HISTORIAL DE EVENTOS
+// ======================================================
 
 app.get(
   '/api/events',
@@ -353,9 +497,9 @@ app.get(
   })
 );
 
-/* =====================================================
-   REGISTRAR EVENTOS
-===================================================== */
+// ======================================================
+// REGISTRAR EVENTOS
+// ======================================================
 
 app.post(
   '/api/events',
@@ -369,47 +513,63 @@ app.post(
         : [req.body]
     ).slice(0, 100);
 
-    const clean = rows
-      .filter(r =>
-        r &&
-        r.id &&
-        r.sector &&
-        r.objectId &&
-        r.label &&
-        r.at
-      )
-      .map(r => ({
-        id: String(r.id).slice(0, 80),
-        sector: String(r.sector),
-        objectId: String(r.objectId),
-        label: String(r.label).slice(0, 200),
-        confidence: Number(r.confidence) || 0,
-        distance: Number(r.distance) || 0,
-        at: new Date(r.at).toISOString(),
-        status:
-          r.status === 'revisada'
-            ? 'revisada'
-            : 'nueva',
-        severity:
-          r.severity === 'warning'
-            ? 'warning'
-            : 'info'
-      }));
+    const clean = [];
+
+    for (const row of rows) {
+      if (
+        !row ||
+        !row.id ||
+        !row.sector ||
+        !row.objectId ||
+        !row.label ||
+        !row.at
+      ) {
+        continue;
+      }
+
+      const date = new Date(row.at);
+
+      if (Number.isNaN(date.getTime())) {
+        continue;
+      }
+
+      clean.push({
+        id: String(row.id).slice(0, 80),
+        sector: String(row.sector),
+        objectId: String(row.objectId),
+        label: String(row.label).slice(0, 200),
+        confidence: Number(row.confidence) || 0,
+        distance: Number(row.distance) || 0,
+        at: date.toISOString(),
+        status: row.status === 'revisada'
+          ? 'revisada'
+          : 'nueva',
+        severity: row.severity === 'warning'
+          ? 'warning'
+          : 'info'
+      });
+    }
+
+    if (!clean.length) {
+      return res.status(400).json({
+        error: 'No se recibieron eventos válidos'
+      });
+    }
 
     await store.events.insertMany(
       clean,
       req.user.id
     );
 
-    res.status(201).json({
+    return res.status(201).json({
       inserted: clean.length
     });
   })
 );
 
-/* =====================================================
-   REVISAR EVENTOS
-===================================================== */
+// ======================================================
+// REVISAR EVENTOS
+// ======================================================
 
 app.patch(
   '/api/events/:id',
@@ -417,30 +577,29 @@ app.patch(
   can('alerts:review'),
   wrap(async (req, res) => {
 
-    const status =
-      req.body?.status === 'nueva'
-        ? 'nueva'
-        : 'revisada';
+    const status = req.body?.status === 'nueva'
+      ? 'nueva'
+      : 'revisada';
 
-    const ok = await store.events.setStatus(
+    const updated = await store.events.setStatus(
       req.params.id,
       status,
       req.user.id
     );
 
-    if (!ok) {
+    if (!updated) {
       return res.status(404).json({
         error: 'Evento no encontrado'
       });
     }
 
-    res.json({ ok: true });
+    return res.json({ ok: true });
   })
 );
 
-/* =====================================================
-   ANÁLISIS DE IMÁGENES
-===================================================== */
+// ======================================================
+// LISTAR ANÁLISIS
+// ======================================================
 
 app.get(
   '/api/analyses',
@@ -451,9 +610,9 @@ app.get(
   })
 );
 
-/* =====================================================
-   GUARDAR ANÁLISIS
-===================================================== */
+// ======================================================
+// GUARDAR ANÁLISIS
+// ======================================================
 
 app.post(
   '/api/analyses',
@@ -461,36 +620,48 @@ app.post(
   can('data:write'),
   wrap(async (req, res) => {
 
-    const a = req.body || {};
+    const analysis = req.body || {};
 
-    if (!a.id || !a.sector) {
+    if (!analysis.id || !analysis.sector) {
       return res.status(400).json({
-        error: 'Datos incompletos'
+        error: 'Datos incompletos del análisis'
+      });
+    }
+
+    const date = new Date(analysis.at || Date.now());
+
+    if (Number.isNaN(date.getTime())) {
+      return res.status(400).json({
+        error: 'Fecha de análisis inválida'
       });
     }
 
     await store.analyses.insert({
-      id: String(a.id).slice(0, 80),
-      at: new Date(a.at || Date.now()).toISOString(),
-      sector: String(a.sector),
-      source: String(a.source || 'imagen').slice(0, 200),
-      mode: String(a.mode || 'deteccion'),
-      detections: Array.isArray(a.detections)
-        ? a.detections.slice(0, 200)
+      id: String(analysis.id).slice(0, 80),
+      at: date.toISOString(),
+      sector: String(analysis.sector),
+      source: String(
+        analysis.source || 'imagen'
+      ).slice(0, 200),
+      mode: String(analysis.mode || 'deteccion'),
+      detections: Array.isArray(analysis.detections)
+        ? analysis.detections.slice(0, 200)
         : [],
-      durationMs: Number(a.durationMs) || 0,
-      status: String(a.status || 'COMPLETADO')
+      durationMs: Number(analysis.durationMs) || 0,
+      status: String(
+        analysis.status || 'COMPLETADO'
+      )
     }, req.user.id);
 
-    res.status(201).json({
+    return res.status(201).json({
       ok: true
     });
   })
 );
 
-/* =====================================================
-   ELIMINAR DATOS
-===================================================== */
+// ======================================================
+// ELIMINAR HISTORIAL
+// ======================================================
 
 app.delete(
   '/api/data',
@@ -505,9 +676,9 @@ app.delete(
   })
 );
 
-/* =====================================================
-   LISTAR USUARIOS
-===================================================== */
+// ======================================================
+// LISTAR USUARIOS
+// ======================================================
 
 app.get(
   '/api/users',
@@ -518,9 +689,9 @@ app.get(
   })
 );
 
-/* =====================================================
-   CREAR USUARIOS
-===================================================== */
+// ======================================================
+// CREAR USUARIOS
+// ======================================================
 
 app.post(
   '/api/users',
@@ -535,11 +706,14 @@ app.post(
       password
     } = req.body || {};
 
-    if (
-      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
-        String(email || '')
-      )
-    ) {
+    const normalizedEmail = String(email || '')
+      .trim()
+      .toLowerCase();
+
+    const validEmail =
+      /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail);
+
+    if (!validEmail) {
       return res.status(400).json({
         error: 'Correo no válido'
       });
@@ -557,26 +731,26 @@ app.post(
       });
     }
 
-    if (await store.users.findByEmail(email)) {
+    if (await store.users.findByEmail(normalizedEmail)) {
       return res.status(409).json({
         error: 'Ya existe un usuario con ese correo'
       });
     }
 
     const user = await store.users.create({
-      email: String(email).trim(),
-      name: String(name || email).trim(),
+      email: normalizedEmail,
+      name: String(name || normalizedEmail).trim(),
       role,
       passwordHash: await bcrypt.hash(password, 10)
     });
 
-    res.status(201).json(user);
+    return res.status(201).json(user);
   })
 );
 
-/* =====================================================
-   ACTUALIZAR USUARIOS
-===================================================== */
+// ======================================================
+// ACTUALIZAR USUARIOS
+// ======================================================
 
 app.patch(
   '/api/users/:id',
@@ -601,10 +775,10 @@ app.patch(
     }
 
     if (
-      req.params.id === req.user.id &&
+      String(req.params.id) === String(req.user.id) &&
       (
         active === false ||
-        (role && role !== 'admin')
+        (role !== undefined && role !== 'admin')
       )
     ) {
       return res.status(400).json({
@@ -626,10 +800,9 @@ app.patch(
       {
         name,
         role,
-        active:
-          active === undefined
-            ? undefined
-            : Boolean(active),
+        active: active === undefined
+          ? undefined
+          : Boolean(active),
         passwordHash: password
           ? await bcrypt.hash(password, 10)
           : undefined
@@ -642,13 +815,13 @@ app.patch(
       });
     }
 
-    res.json(user);
+    return res.json(user);
   })
 );
 
-/* =====================================================
-   ELIMINAR USUARIOS
-===================================================== */
+// ======================================================
+// ELIMINAR USUARIOS
+// ======================================================
 
 app.delete(
   '/api/users/:id',
@@ -656,7 +829,7 @@ app.delete(
   can('users:manage'),
   wrap(async (req, res) => {
 
-    if (req.params.id === req.user.id) {
+    if (String(req.params.id) === String(req.user.id)) {
       return res.status(400).json({
         error: 'No puedes eliminar tu propio usuario'
       });
@@ -672,13 +845,13 @@ app.delete(
       });
     }
 
-    res.json({ ok: true });
+    return res.json({ ok: true });
   })
 );
 
-/* =====================================================
-   RUTAS NO ENCONTRADAS
-===================================================== */
+// ======================================================
+// RUTAS NO ENCONTRADAS
+// ======================================================
 
 app.use((_req, res) => {
   res.status(404).json({
@@ -686,63 +859,98 @@ app.use((_req, res) => {
   });
 });
 
-/* =====================================================
-   MANEJO DE ERRORES
-===================================================== */
+// ======================================================
+// MANEJO GLOBAL DE ERRORES
+// ======================================================
 
-app.use((err, _req, res, _next) => {
-  console.error(err);
+app.use((error, _req, res, _next) => {
+  console.error('[BACKEND ERROR]', error);
 
-  const status =
-    err.message?.startsWith('Origen no permitido')
-      ? 403
-      : err.status || err.statusCode || 500;
+  if (res.headersSent) {
+    return;
+  }
+
+  const status = error.message?.startsWith(
+    'Origen no permitido'
+  )
+    ? 403
+    : error.status || error.statusCode || 500;
 
   res.status(status).json({
-    error: err.message || 'Error interno'
+    error: status >= 500
+      ? 'Error interno del servidor'
+      : error.message || 'Error de solicitud'
   });
 });
 
-/* =====================================================
-   INICIALIZACIÓN DE SUPABASE / ALMACENAMIENTO
-===================================================== */
+// ======================================================
+// INICIALIZAR ALMACENAMIENTO
+// ======================================================
 
-if (config.isProd && store.kind === 'json') {
-  console.warn(
-    'AVISO: producción sin DATABASE_URL. ' +
-    'Configura Supabase para conservar los datos.'
-  );
+async function startServer() {
+  try {
+    if (config.isProd && store.kind === 'json') {
+      console.warn(
+        '[AVISO] Producción sin DATABASE_URL. ' +
+        'Configura Supabase para conservar los datos.'
+      );
+    }
+
+    await store.init();
+
+    const created = await seedUsers();
+
+    if (created) {
+      console.log('[USUARIOS] Usuarios iniciales creados.');
+    }
+
+    // ==================================================
+    // INICIAR SERVIDOR
+    // ==================================================
+
+    app.listen(config.port, '0.0.0.0', () => {
+      console.log('======================================');
+      console.log('VISION AI - BACKEND ACTIVO');
+      console.log('======================================');
+
+      console.log('Puerto:', config.port);
+
+      console.log(
+        'Almacenamiento:',
+        store.kind === 'postgres'
+          ? 'PostgreSQL (Supabase)'
+          : 'Archivo JSON local'
+      );
+
+      console.log('YOLO SERVICE:', YOLO_SERVICE_URL);
+
+      console.log(
+        'Endpoints YOLO:',
+        '/detect, /segment, /quality'
+      );
+
+      console.log(
+        'Timeout YOLO:',
+        YOLO_TIMEOUT_MS + ' ms'
+      );
+
+      console.log(
+        'CORS permitidos:',
+        config.corsOrigins
+      );
+
+      console.log('Backend listo para recibir solicitudes');
+      console.log('======================================');
+    });
+
+  } catch (error) {
+    console.error(
+      '[STARTUP ERROR] No se pudo iniciar VISION AI:',
+      error
+    );
+
+    process.exit(1);
+  }
 }
 
-await store.init();
-
-if (await seedUsers()) {
-  console.log('Usuarios iniciales creados.');
-}
-
-/* =====================================================
-   INICIAR SERVIDOR EXPRESS
-===================================================== */
-
-app.listen(config.port, () => {
-  console.log(
-    `VISION AI API escuchando en http://localhost:${config.port}`
-  );
-
-  console.log(
-    `Almacenamiento: ${
-      store.kind === 'postgres'
-        ? 'PostgreSQL (Supabase)'
-        : 'archivo JSON local'
-    }`
-  );
-
-  console.log(
-    'YOLO SERVICE: ' +
-    (process.env.YOLO_SERVICE_URL || 'http://127.0.0.1:8000')
-  );
-
-  console.log(
-    'Rutas YOLO disponibles: /detect, /segment, /quality'
-  );
-});
+await startServer();
