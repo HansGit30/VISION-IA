@@ -4,20 +4,25 @@ import io
 import time
 import base64
 import logging
+import tempfile
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from PIL import Image, UnidentifiedImageError
+from inference_sdk import InferenceHTTPClient, InferenceConfiguration
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("vision-ai")
 
-app = FastAPI(title="VISION AI - Roboflow", version="3.0.0")
+app = FastAPI(title="VISION AI - Roboflow", version="3.1.0")
 
 API_KEY = os.getenv("ROBOFLOW_API_KEY", "").strip()
 
 GENERAL = os.getenv("ROBOFLOW_GENERAL_MODEL", "").strip()
+WORKSPACE = os.getenv("ROBOFLOW_WORKSPACE", "hans-ol").strip()
+WORKFLOW_ID = os.getenv("ROBOFLOW_WORKFLOW_ID", "").strip()
 SAFETY = os.getenv("ROBOFLOW_SAFETY_MODEL", "").strip()
 CONES = os.getenv("ROBOFLOW_CONES_MODEL", "").strip()
 QUALITY = os.getenv("ROBOFLOW_QUALITY_MODEL", "").strip()
@@ -188,6 +193,73 @@ def run_roboflow(model_id, image_bytes, confidence, source, width, height, task=
     )
 
 
+
+def run_person_workflow(image_bytes, confidence, width, height):
+    """Ejecuta el Workflow de personas sin cargar modelos en Render."""
+    if not API_KEY or not WORKFLOW_ID:
+        raise RuntimeError("Faltan ROBOFLOW_API_KEY o ROBOFLOW_WORKFLOW_ID")
+
+    # El SDK acepta una ruta de imagen local; el archivo se elimina al terminar.
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        rgb = img.convert("RGB")
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            image_path = tmp.name
+        try:
+            rgb.save(image_path, format="JPEG", quality=90)
+        finally:
+            rgb.close()
+
+    try:
+        client = InferenceHTTPClient(
+            api_url="https://serverless.roboflow.com",
+            api_key=API_KEY,
+        ).configure(InferenceConfiguration(api_key_transport="header"))
+        raw = client.run_workflow(
+            workspace_name=WORKSPACE,
+            workflow_id=WORKFLOW_ID,
+            images={"image": image_path},
+            use_cache=True,
+        )
+    finally:
+        Path(image_path).unlink(missing_ok=True)
+
+    # Workflows suele devolver una lista de outputs, cada uno con un bloque
+    # de predicciones: {"predictions": {"image": {...}, "predictions": [...]}}.
+    # También se admite la respuesta de detección directa.
+    outputs = raw if isinstance(raw, list) else [raw]
+    detections = []
+    recognized = False
+
+    for output in outputs:
+        if not isinstance(output, dict):
+            continue
+        candidates = [output]
+        candidates.extend(v for v in output.values() if isinstance(v, dict))
+        for candidate in candidates:
+            predictions = candidate.get("predictions")
+            if not isinstance(predictions, list):
+                continue
+            recognized = True
+            info = candidate.get("image") or {}
+            pw = float(info.get("width") or width) if isinstance(info, dict) else width
+            ph = float(info.get("height") or height) if isinstance(info, dict) else height
+            normalized = normalize_predictions(candidate, pw, ph, "roboflow-person-workflow")
+            for detection in normalized:
+                if detection["label"].strip().lower() in ("person", "people", "persona"):
+                    if detection["score"] >= confidence:
+                        detection["label"] = "person"
+                        detections.append(detection)
+
+    if not recognized:
+        keys = [list(o.keys()) for o in outputs if isinstance(o, dict)]
+        raise RuntimeError(
+            f"Workflow sin salida de predicciones reconocible. Claves: {keys}"
+        )
+
+    log.info("Workflow %s: %d personas", WORKFLOW_ID, len(detections))
+    return detections
+
+
 def merge_detections(items):
     merged = []
 
@@ -238,14 +310,14 @@ def analyze_external(image_bytes, width, height, confidence, mode):
         ]
     else:
         models = [
-            ("general", GENERAL, "detect"),
+            ("general", GENERAL if not WORKFLOW_ID else "", "detect"),
             ("safety", SAFETY, "detect"),
             ("cones", CONES, "detect"),
         ]
 
     active = [(name, model, task) for name, model, task in models if model]
 
-    if not active:
+    if not active and not (mode == "detect" and WORKFLOW_ID):
         raise HTTPException(
             503,
             f"No hay modelos externos configurados para {mode}."
@@ -256,7 +328,12 @@ def analyze_external(image_bytes, width, height, confidence, mode):
     successful_models = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
+        futures = {}
+        if mode == "detect" and WORKFLOW_ID:
+            futures[executor.submit(
+                run_person_workflow, image_bytes, confidence, width, height
+            )] = ("person-workflow", WORKFLOW_ID)
+        futures.update({
             executor.submit(
                 run_roboflow,
                 model,
@@ -268,7 +345,7 @@ def analyze_external(image_bytes, width, height, confidence, mode):
                 task,
             ): (name, model)
             for name, model, task in active
-        }
+        })
 
         for future in as_completed(futures):
             name, model = futures[future]
@@ -330,7 +407,9 @@ def health():
         "version": app.version,
         "api_key_configured": bool(API_KEY),
         "models": {
-            "general": GENERAL or None,
+            "general": GENERAL if not WORKFLOW_ID else None,
+            "person_workflow": WORKFLOW_ID or None,
+            "workspace": WORKSPACE,
             "safety": SAFETY or None,
             "cones": CONES or None,
             "quality": QUALITY or None,

@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 httpx
 pillow
+inference-sdk>=1.5.0
