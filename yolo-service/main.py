@@ -16,7 +16,7 @@ from inference_sdk import InferenceHTTPClient, InferenceConfiguration
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("vision-ai")
 
-app = FastAPI(title="VISION AI - Roboflow", version="3.1.0")
+app = FastAPI(title="VISION AI - Roboflow", version="3.1.1")
 
 API_KEY = os.getenv("ROBOFLOW_API_KEY", "").strip()
 
@@ -195,11 +195,10 @@ def run_roboflow(model_id, image_bytes, confidence, source, width, height, task=
 
 
 def run_person_workflow(image_bytes, confidence, width, height):
-    """Ejecuta el Workflow de personas sin cargar modelos en Render."""
+    """Ejecuta el Workflow y registra sus salidas sin revelar credenciales."""
     if not API_KEY or not WORKFLOW_ID:
         raise RuntimeError("Faltan ROBOFLOW_API_KEY o ROBOFLOW_WORKFLOW_ID")
 
-    # El SDK acepta una ruta de imagen local; el archivo se elimina al terminar.
     with Image.open(io.BytesIO(image_bytes)) as img:
         rgb = img.convert("RGB")
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
@@ -223,40 +222,54 @@ def run_person_workflow(image_bytes, confidence, width, height):
     finally:
         Path(image_path).unlink(missing_ok=True)
 
-    # Workflows suele devolver una lista de outputs, cada uno con un bloque
-    # de predicciones: {"predictions": {"image": {...}, "predictions": [...]}}.
-    # También se admite la respuesta de detección directa.
-    outputs = raw if isinstance(raw, list) else [raw]
+    # La estructura depende de los bloques Output configurados en Roboflow.
+    # Buscar listas de predicciones anidadas, sin duplicar objetos visitados.
+    candidates = []
+    visited = set()
+
+    def walk(node, depth=0):
+        if depth > 8 or id(node) in visited:
+            return
+        if not isinstance(node, (dict, list)):
+            return
+        visited.add(id(node))
+        if isinstance(node, list):
+            for item in node:
+                walk(item, depth + 1)
+            return
+        preds = node.get("predictions")
+        if isinstance(preds, list):
+            candidates.append(node)
+        for value in node.values():
+            if isinstance(value, (dict, list)):
+                walk(value, depth + 1)
+
+    walk(raw)
+    log.info("WORKFLOW %s | tipo=%s | bloques_predicciones=%d",
+             WORKFLOW_ID, type(raw).__name__, len(candidates))
+
     detections = []
-    recognized = False
+    labels_seen = set()
+    total_raw = 0
+    for candidate in candidates:
+        preds = candidate["predictions"]
+        total_raw += len(preds)
+        info = candidate.get("image") or {}
+        pw = float(info.get("width") or width) if isinstance(info, dict) else width
+        ph = float(info.get("height") or height) if isinstance(info, dict) else height
+        normalized = normalize_predictions(candidate, pw, ph, "roboflow-person-workflow")
+        for detection in normalized:
+            label = detection["label"].strip().lower()
+            labels_seen.add(label)
+            if label in {"person", "people", "persona"} and detection["score"] >= confidence:
+                detection["label"] = "person"
+                detections.append(detection)
 
-    for output in outputs:
-        if not isinstance(output, dict):
-            continue
-        candidates = [output]
-        candidates.extend(v for v in output.values() if isinstance(v, dict))
-        for candidate in candidates:
-            predictions = candidate.get("predictions")
-            if not isinstance(predictions, list):
-                continue
-            recognized = True
-            info = candidate.get("image") or {}
-            pw = float(info.get("width") or width) if isinstance(info, dict) else width
-            ph = float(info.get("height") or height) if isinstance(info, dict) else height
-            normalized = normalize_predictions(candidate, pw, ph, "roboflow-person-workflow")
-            for detection in normalized:
-                if detection["label"].strip().lower() in ("person", "people", "persona"):
-                    if detection["score"] >= confidence:
-                        detection["label"] = "person"
-                        detections.append(detection)
-
-    if not recognized:
-        keys = [list(o.keys()) for o in outputs if isinstance(o, dict)]
-        raise RuntimeError(
-            f"Workflow sin salida de predicciones reconocible. Claves: {keys}"
-        )
-
-    log.info("Workflow %s: %d personas", WORKFLOW_ID, len(detections))
+    log.info("WORKFLOW %s | predicciones=%d | clases=%s | personas=%d",
+             WORKFLOW_ID, total_raw, sorted(labels_seen), len(detections))
+    if not candidates:
+        keys = [list(x.keys()) for x in raw if isinstance(x, dict)] if isinstance(raw, list) else (list(raw.keys()) if isinstance(raw, dict) else [])
+        raise RuntimeError(f"Workflow sin lista de predicciones reconocible. Claves: {keys}")
     return detections
 
 
