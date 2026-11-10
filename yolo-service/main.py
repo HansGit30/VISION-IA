@@ -16,7 +16,7 @@ from inference_sdk import InferenceHTTPClient, InferenceConfiguration
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("vision-ai")
 
-app = FastAPI(title="VISION AI - Roboflow", version="3.1.1")
+app = FastAPI(title="VISION AI - Roboflow", version="3.1.2")
 
 API_KEY = os.getenv("ROBOFLOW_API_KEY", "").strip()
 
@@ -24,6 +24,7 @@ GENERAL = os.getenv("ROBOFLOW_GENERAL_MODEL", "").strip()
 WORKSPACE = os.getenv("ROBOFLOW_WORKSPACE", "hans-ol").strip()
 WORKFLOW_ID = os.getenv("ROBOFLOW_WORKFLOW_ID", "").strip()
 SAFETY = os.getenv("ROBOFLOW_SAFETY_MODEL", "").strip()
+HELMET = os.getenv("ROBOFLOW_HELMET_MODEL", "").strip()
 CONES = os.getenv("ROBOFLOW_CONES_MODEL", "").strip()
 QUALITY = os.getenv("ROBOFLOW_QUALITY_MODEL", "").strip()
 DEFECTS = os.getenv("ROBOFLOW_DEFECT_MODEL", "").strip()
@@ -325,6 +326,7 @@ def analyze_external(image_bytes, width, height, confidence, mode):
         models = [
             ("general", GENERAL if not WORKFLOW_ID else "", "detect"),
             ("safety", SAFETY, "detect"),
+            ("helmet", HELMET, "detect"),
             ("cones", CONES, "detect"),
         ]
 
@@ -424,6 +426,7 @@ def health():
             "person_workflow": WORKFLOW_ID or None,
             "workspace": WORKSPACE,
             "safety": SAFETY or None,
+            "helmet": HELMET or None,
             "cones": CONES or None,
             "quality": QUALITY or None,
             "defects": DEFECTS or None,
